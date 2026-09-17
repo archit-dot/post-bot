@@ -3,14 +3,17 @@ import html
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
     Update,
 )
 from telegram.constants import ParseMode
@@ -22,11 +25,9 @@ from telegram.error import (
     TimedOut,
 )
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
     ConversationHandler,
     MessageHandler,
     filters,
@@ -36,10 +37,11 @@ from scheduler import SchedulerDB
 
 
 # ============================================================
-# CONFIGURATION
+# PATHS / CONFIG
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -54,8 +56,43 @@ except ValueError:
     OWNER_ID = 0
 
 
-MAX_MEDIA = 10
+# ============================================================
+# SETTINGS
+# ============================================================
+
+MAX_MEDIA = 50
+
+# Telegram allows a maximum of 10 photo/video items
+# in one media group.
+TELEGRAM_ALBUM_SIZE = 10
+
 MAX_RETRIES = 3
+
+
+# ============================================================
+# TIMEZONE
+# ============================================================
+
+UTC = timezone.utc
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def utc_now():
+    return datetime.now(UTC)
+
+
+def format_ist(timestamp):
+    return datetime.fromtimestamp(
+        timestamp,
+        tz=IST,
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S IST"
+    )
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 scheduler_db = SchedulerDB()
 
@@ -92,7 +129,6 @@ WAITING_MEDIA = 1
 WAITING_CAPTION = 2
 WAITING_CHANNELS = 3
 WAITING_DELAY = 4
-WAITING_SCHEDULE = 5
 
 
 # ============================================================
@@ -108,11 +144,9 @@ def is_owner(update: Update) -> bool:
     return user.id == OWNER_ID
 
 
-async def owner_only(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> bool:
+async def owner_only(update, context) -> bool:
     if not is_owner(update):
+
         if update.effective_message:
             await update.effective_message.reply_text(
                 "⛔ You are not authorized to use this bot."
@@ -124,32 +158,27 @@ async def owner_only(
 
 
 # ============================================================
-# START
+# /START
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start_command(update, context):
     if not await owner_only(update, context):
         return
 
     await update.message.reply_text(
         "📡 <b>Telepost</b>\n\n"
-        "Telegram scheduled posting bot.\n\n"
+        "Create and schedule media posts for your "
+        "Telegram channels/groups.\n\n"
         "Use /newpost to create a post.",
         parse_mode=ParseMode.HTML,
     )
 
 
 # ============================================================
-# NEW POST
+# /NEWPOST
 # ============================================================
 
-async def newpost_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def newpost_command(update, context):
     if not await owner_only(update, context):
         return ConversationHandler.END
 
@@ -157,30 +186,38 @@ async def newpost_command(
     context.user_data["media"] = []
 
     await update.message.reply_text(
-        "📎 Send up to 10 photos/videos/documents/audio/voice/GIFs.\n\n"
-        "When finished, send /done."
+        "📎 Send up to <b>50</b> photos/videos/documents/"
+        "audio/voice/GIFs.\n\n"
+        "Telegram albums will automatically be split "
+        "into batches of 10.\n\n"
+        "When finished, send /done.",
+        parse_mode=ParseMode.HTML,
     )
 
     return WAITING_MEDIA
 
 
 # ============================================================
-# MEDIA RECEIVING
+# RECEIVE MEDIA
 # ============================================================
 
-async def receive_media(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def receive_media(update, context):
     if not await owner_only(update, context):
         return ConversationHandler.END
 
-    media = context.user_data.setdefault("media", [])
+    media = context.user_data.setdefault(
+        "media",
+        [],
+    )
 
     if len(media) >= MAX_MEDIA:
+
         await update.message.reply_text(
-            "⚠️ Maximum 10 media files allowed."
+            "⚠️ Maximum limit reached.\n\n"
+            "You can send up to 50 media files "
+            "in one post."
         )
+
         return WAITING_MEDIA
 
     message = update.message
@@ -188,51 +225,61 @@ async def receive_media(
     item = None
 
     if message.photo:
+
         item = {
             "type": "photo",
             "file_id": message.photo[-1].file_id,
         }
 
     elif message.video:
+
         item = {
             "type": "video",
             "file_id": message.video.file_id,
         }
 
     elif message.document:
+
         item = {
             "type": "document",
             "file_id": message.document.file_id,
         }
 
     elif message.audio:
+
         item = {
             "type": "audio",
             "file_id": message.audio.file_id,
         }
 
     elif message.voice:
+
         item = {
             "type": "voice",
             "file_id": message.voice.file_id,
         }
 
     elif message.animation:
+
         item = {
             "type": "animation",
             "file_id": message.animation.file_id,
         }
 
     if item is None:
+
         await update.message.reply_text(
             "❌ Unsupported media type."
         )
+
         return WAITING_MEDIA
 
     media.append(item)
 
+    count = len(media)
+
     await update.message.reply_text(
-        f"✅ Media added ({len(media)}/{MAX_MEDIA}).\n"
+        f"✅ Added {count}/{MAX_MEDIA}\n\n"
         "Send more or /done."
     )
 
@@ -240,26 +287,29 @@ async def receive_media(
 
 
 # ============================================================
-# DONE MEDIA
+# /DONE
 # ============================================================
 
-async def done_media(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def done_media(update, context):
     if not await owner_only(update, context):
         return ConversationHandler.END
 
-    media = context.user_data.get("media", [])
+    media = context.user_data.get(
+        "media",
+        [],
+    )
 
     if not media:
+
         await update.message.reply_text(
             "❌ No media added yet."
         )
+
         return WAITING_MEDIA
 
     await update.message.reply_text(
-        "📝 Send the caption.\n\n"
+        f"✅ {len(media)} media files received.\n\n"
+        "📝 Now send the caption.\n\n"
         "You can use Telegram HTML formatting."
     )
 
@@ -267,23 +317,25 @@ async def done_media(
 
 
 # ============================================================
-# CAPTION
+# RECEIVE CAPTION
 # ============================================================
 
-async def receive_caption(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def receive_caption(update, context):
     if not await owner_only(update, context):
         return ConversationHandler.END
 
-    context.user_data["caption"] = update.message.text or ""
+    context.user_data["caption"] = (
+        update.message.text or ""
+    )
 
     await update.message.reply_text(
-        "📢 Send destination channel IDs.\n\n"
-        "Example:\n"
-        "<code>-1001234567890</code>\n\n"
-        "For multiple channels, put each ID on a new line.",
+        "📢 Send destination channel/group IDs.\n\n"
+        "You can use one per line:\n"
+        "<code>-1001234567890</code>\n"
+        "<code>-1009876543210</code>\n\n"
+        "Or comma-separated:\n"
+        "<code>@channelone,@channeltwo</code>\n\n"
+        "Public usernames are also supported.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -291,38 +343,105 @@ async def receive_caption(
 
 
 # ============================================================
-# CHANNELS
+# PARSE DESTINATIONS
 # ============================================================
 
-async def receive_channels(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+def parse_destinations(raw_text):
+    """
+    Accepts:
+
+        @channel1
+        @channel2
+
+    or:
+
+        @channel1,@channel2
+
+    or:
+
+        -1001234567890
+        -1009876543210
+
+    or mixed formats.
+    """
+
+    channels = []
+
+    # Allow both commas and new lines.
+    normalized = raw_text.replace(
+        ",",
+        "\n",
+    )
+
+    for value in normalized.splitlines():
+
+        value = value.strip()
+
+        if not value:
+            continue
+
+        # Numeric Telegram ID
+        try:
+
+            channels.append(
+                int(value)
+            )
+
+            continue
+
+        except ValueError:
+            pass
+
+        # Public username
+        if value.startswith("@"):
+
+            channels.append(
+                value
+            )
+
+    # Remove duplicates while preserving order.
+    unique_channels = []
+
+    for channel in channels:
+
+        if channel not in unique_channels:
+
+            unique_channels.append(
+                channel
+            )
+
+    return unique_channels
+
+
+# ============================================================
+# RECEIVE CHANNELS
+# ============================================================
+
+async def receive_channels(update, context):
     if not await owner_only(update, context):
         return ConversationHandler.END
 
     raw = update.message.text or ""
 
-    channels = []
-
-    for line in raw.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        try:
-            channels.append(int(line))
-        except ValueError:
-            pass
+    channels = parse_destinations(
+        raw
+    )
 
     if not channels:
+
         await update.message.reply_text(
-            "❌ No valid channel IDs found."
+            "❌ No valid destinations found.\n\n"
+            "Use numeric IDs or @usernames."
         )
+
         return WAITING_CHANNELS
 
     context.user_data["channels"] = channels
+
+    destinations_text = "\n".join(
+        f"• {channel}"
+        for channel in channels
+    )
 
     keyboard = [
         [
@@ -352,28 +471,33 @@ async def receive_channels(
     ]
 
     await update.message.reply_text(
-        "⏱ Choose delay between channel posts:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "✅ <b>Destinations:</b>\n\n"
+        f"{html.escape(destinations_text)}\n\n"
+        "⏱ Choose delay between destination posts:",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+        parse_mode=ParseMode.HTML,
     )
 
     return WAITING_DELAY
 
 
 # ============================================================
-# DELAY
+# DELAY CALLBACK
 # ============================================================
 
-async def delay_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def delay_callback(update, context):
     query = update.callback_query
+
     await query.answer()
 
     if query.from_user.id != OWNER_ID:
         return
 
-    delay = int(query.data.split("_")[1])
+    delay = int(
+        query.data.split("_")[1]
+    )
 
     context.user_data["delay"] = delay
 
@@ -407,37 +531,67 @@ async def delay_callback(
     ]
 
     await query.edit_message_text(
-        f"⏱ Delay selected: {delay} seconds\n\n"
+        f"⏱ Delay: {delay} seconds\n\n"
         "Choose when to publish:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
     )
 
 
 # ============================================================
-# SCHEDULE
+# SCHEDULE CALLBACK
 # ============================================================
 
-async def schedule_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def schedule_callback(update, context):
     query = update.callback_query
+
     await query.answer()
 
     if query.from_user.id != OWNER_ID:
         return
 
-    action = query.data.replace("schedule_", "")
+    action = query.data.replace(
+        "schedule_",
+        "",
+    )
 
-    media = context.user_data.get("media", [])
-    caption = context.user_data.get("caption", "")
-    channels = context.user_data.get("channels", [])
-    delay = context.user_data.get("delay", 0)
+    media = context.user_data.get(
+        "media",
+        [],
+    )
 
-    if not media or not channels:
-        await query.edit_message_text(
-            "❌ Post data is incomplete."
+    caption = context.user_data.get(
+        "caption",
+        "",
+    )
+
+    channels = context.user_data.get(
+        "channels",
+        [],
+    )
+
+    delay = int(
+        context.user_data.get(
+            "delay",
+            0,
         )
+    )
+
+    if not media:
+
+        await query.edit_message_text(
+            "❌ No media found."
+        )
+
+        return ConversationHandler.END
+
+    if not channels:
+
+        await query.edit_message_text(
+            "❌ No destinations found."
+        )
+
         return ConversationHandler.END
 
     data = {
@@ -447,9 +601,14 @@ async def schedule_callback(
         "delay": delay,
     }
 
-    now = datetime.now()
+    now = utc_now()
+
+    # ========================================================
+    # POST NOW
+    # ========================================================
 
     if action == "now":
+
         job_id = scheduler_db.create_job(
             job_type="one_time",
             run_at=now.timestamp(),
@@ -460,17 +619,26 @@ async def schedule_callback(
         await schedule_saved_job(
             context.application,
             job_id,
-            run_at=now,
+            now,
         )
 
         await query.edit_message_text(
-            f"🚀 Post queued.\n\n"
+            "🚀 <b>Post queued</b>\n\n"
+            f"Media: {len(media)}/50\n"
+            f"Destinations: {len(channels)}\n"
             f"Job ID: <code>{job_id}</code>",
             parse_mode=ParseMode.HTML,
         )
+
+    # ========================================================
+    # IN 1 HOUR
+    # ========================================================
 
     elif action == "1h":
-        run_at = now + timedelta(hours=1)
+
+        run_at = now + timedelta(
+            hours=1
+        )
 
         job_id = scheduler_db.create_job(
             job_type="one_time",
@@ -482,17 +650,27 @@ async def schedule_callback(
         await schedule_saved_job(
             context.application,
             job_id,
-            run_at=run_at,
+            run_at,
         )
 
         await query.edit_message_text(
-            f"⏰ Scheduled for {run_at:%Y-%m-%d %H:%M:%S}\n\n"
+            "⏰ <b>Scheduled</b>\n\n"
+            f"Run: {run_at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST\n"
+            f"Media: {len(media)}/50\n"
+            f"Destinations: {len(channels)}\n"
             f"Job ID: <code>{job_id}</code>",
             parse_mode=ParseMode.HTML,
         )
+
+    # ========================================================
+    # IN 24 HOURS
+    # ========================================================
 
     elif action == "24h":
-        run_at = now + timedelta(hours=24)
+
+        run_at = now + timedelta(
+            hours=24
+        )
 
         job_id = scheduler_db.create_job(
             job_type="one_time",
@@ -504,21 +682,27 @@ async def schedule_callback(
         await schedule_saved_job(
             context.application,
             job_id,
-            run_at=run_at,
+            run_at,
         )
 
         await query.edit_message_text(
-            f"⏰ Scheduled for {run_at:%Y-%m-%d %H:%M:%S}\n\n"
+            "⏰ <b>Scheduled</b>\n\n"
+            f"Run: {run_at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST\n"
+            f"Media: {len(media)}/50\n"
+            f"Destinations: {len(channels)}\n"
             f"Job ID: <code>{job_id}</code>",
             parse_mode=ParseMode.HTML,
         )
 
+    # ========================================================
+    # EVERY HOUR
+    # ========================================================
+
     elif action == "hourly":
-        run_at = now
 
         job_id = scheduler_db.create_job(
             job_type="repeating",
-            run_at=run_at.timestamp(),
+            run_at=now.timestamp(),
             interval_seconds=3600,
             data=data,
         )
@@ -526,22 +710,28 @@ async def schedule_callback(
         await schedule_saved_job(
             context.application,
             job_id,
-            run_at=run_at,
+            now,
         )
 
         await query.edit_message_text(
-            "🔁 Repeating post created.\n\n"
-            "Interval: Every hour\n"
+            "🔁 <b>Repeating post created</b>\n\n"
+            "First post: Immediately\n"
+            "Then: Every hour\n"
+            f"Media: {len(media)}/50\n"
+            f"Destinations: {len(channels)}\n"
             f"Job ID: <code>{job_id}</code>",
             parse_mode=ParseMode.HTML,
         )
 
+    # ========================================================
+    # EVERY 24 HOURS
+    # ========================================================
+
     elif action == "daily":
-        run_at = now
 
         job_id = scheduler_db.create_job(
             job_type="repeating",
-            run_at=run_at.timestamp(),
+            run_at=now.timestamp(),
             interval_seconds=86400,
             data=data,
         )
@@ -549,12 +739,15 @@ async def schedule_callback(
         await schedule_saved_job(
             context.application,
             job_id,
-            run_at=run_at,
+            now,
         )
 
         await query.edit_message_text(
-            "🔁 Repeating post created.\n\n"
-            "Interval: Every 24 hours\n"
+            "🔁 <b>Repeating post created</b>\n\n"
+            "First post: Immediately\n"
+            "Then: Every 24 hours\n"
+            f"Media: {len(media)}/50\n"
+            f"Destinations: {len(channels)}\n"
             f"Job ID: <code>{job_id}</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -565,30 +758,64 @@ async def schedule_callback(
 
 
 # ============================================================
-# RETRY SYSTEM
+# RETRY TEMPORARY ERRORS ONLY
 # ============================================================
 
-async def retry_operation(operation, description="Telegram request"):
+async def retry_operation(
+    operation,
+    description="Telegram request",
+):
+    """
+    Retry only temporary Telegram/network errors.
+
+    BadRequest and Forbidden are NOT retried because they
+    represent permanent request/access problems.
+    """
+
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
+
         try:
+
             return await operation()
 
+        # ----------------------------------------------------
+        # Telegram rate limit
+        # ----------------------------------------------------
+
         except RetryAfter as error:
+
             last_error = error
 
-            wait_time = int(error.retry_after) + 1
+            wait_time = (
+                int(error.retry_after)
+                + 1
+            )
 
             logger.warning(
-                "%s rate limited. Waiting %s seconds.",
+                "%s rate limited. "
+                "Waiting %s seconds.",
                 description,
                 wait_time,
             )
 
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(
+                wait_time
+            )
 
-        except (TimedOut, NetworkError) as error:
+        # ----------------------------------------------------
+        # Temporary network errors
+        # ----------------------------------------------------
+
+        except (
+            TimedOut,
+            NetworkError,
+        ) as error:
+
             last_error = error
 
             if attempt >= MAX_RETRIES:
@@ -597,18 +824,25 @@ async def retry_operation(operation, description="Telegram request"):
             wait_time = attempt * 2
 
             logger.warning(
-                "%s network error. "
-                "Retry %s/%s in %s seconds: %s",
+                "%s temporary network error. "
+                "Retry %s/%s in %s seconds.",
                 description,
                 attempt,
                 MAX_RETRIES,
                 wait_time,
-                error,
             )
 
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(
+                wait_time
+            )
 
-    raise last_error
+    if last_error:
+
+        raise last_error
+
+    raise RuntimeError(
+        f"{description} failed"
+    )
 
 
 # ============================================================
@@ -622,10 +856,13 @@ async def send_single_media(
     caption="",
 ):
     media_type = item["type"]
+
     file_id = item["file_id"]
 
     async def operation():
+
         if media_type == "photo":
+
             return await bot.send_photo(
                 chat_id=channel_id,
                 photo=file_id,
@@ -634,6 +871,7 @@ async def send_single_media(
             )
 
         if media_type == "video":
+
             return await bot.send_video(
                 chat_id=channel_id,
                 video=file_id,
@@ -642,6 +880,7 @@ async def send_single_media(
             )
 
         if media_type == "document":
+
             return await bot.send_document(
                 chat_id=channel_id,
                 document=file_id,
@@ -650,6 +889,7 @@ async def send_single_media(
             )
 
         if media_type == "audio":
+
             return await bot.send_audio(
                 chat_id=channel_id,
                 audio=file_id,
@@ -658,6 +898,7 @@ async def send_single_media(
             )
 
         if media_type == "voice":
+
             return await bot.send_voice(
                 chat_id=channel_id,
                 voice=file_id,
@@ -666,6 +907,7 @@ async def send_single_media(
             )
 
         if media_type == "animation":
+
             return await bot.send_animation(
                 chat_id=channel_id,
                 animation=file_id,
@@ -691,29 +933,36 @@ async def send_album(
     bot,
     channel_id,
     media,
-    caption,
+    caption="",
 ):
     telegram_media = []
 
-    from telegram import InputMediaPhoto, InputMediaVideo
-
     for index, item in enumerate(media):
-        item_type = item["type"]
 
-        if item_type == "photo":
+        if item["type"] == "photo":
+
             telegram_media.append(
                 InputMediaPhoto(
                     media=item["file_id"],
-                    caption=caption if index == 0 else None,
+                    caption=(
+                        caption
+                        if index == 0
+                        else None
+                    ),
                     parse_mode=ParseMode.HTML,
                 )
             )
 
-        elif item_type == "video":
+        elif item["type"] == "video":
+
             telegram_media.append(
                 InputMediaVideo(
                     media=item["file_id"],
-                    caption=caption if index == 0 else None,
+                    caption=(
+                        caption
+                        if index == 0
+                        else None
+                    ),
                     parse_mode=ParseMode.HTML,
                 )
             )
@@ -722,6 +971,7 @@ async def send_album(
         return
 
     async def operation():
+
         return await bot.send_media_group(
             chat_id=channel_id,
             media=telegram_media,
@@ -734,58 +984,189 @@ async def send_album(
 
 
 # ============================================================
+# SPLIT INTO TELEGRAM ALBUMS
+# ============================================================
+
+def split_into_chunks(
+    items,
+    chunk_size=TELEGRAM_ALBUM_SIZE,
+):
+    return [
+        items[index:index + chunk_size]
+        for index in range(
+            0,
+            len(items),
+            chunk_size,
+        )
+    ]
+
+
+# ============================================================
 # DISPATCH POST
 # ============================================================
 
 async def dispatch_post(
-    application: Application,
-    data: dict,
+    application,
+    data,
 ):
     bot = application.bot
 
-    media = data.get("media", [])
-    caption = data.get("caption", "")
-    channels = data.get("channels", [])
-    delay = int(data.get("delay", 0))
+    media = data.get(
+        "media",
+        [],
+    )
 
-    # Validate/sanitize caption for Telegram HTML mode.
-    # Existing Telegram HTML tags are intentionally preserved.
-    caption = caption.strip()
+    caption = data.get(
+        "caption",
+        "",
+    ).strip()
 
-    for channel_index, channel_id in enumerate(channels):
+    channels = data.get(
+        "channels",
+        [],
+    )
+
+    delay = int(
+        data.get(
+            "delay",
+            0,
+        )
+    )
+
+    if not media:
+
+        logger.error(
+            "Post contains no media."
+        )
+
+        return
+
+    if not channels:
+
+        logger.error(
+            "Post contains no destinations."
+        )
+
+        return
+
+    # Photo/video media can be sent as albums.
+    album_media = [
+        item
+        for item in media
+        if item["type"] in {
+            "photo",
+            "video",
+        }
+    ]
+
+    # Other media types are sent individually.
+    other_media = [
+        item
+        for item in media
+        if item["type"] not in {
+            "photo",
+            "video",
+        }
+    ]
+
+    album_chunks = split_into_chunks(
+        album_media,
+        TELEGRAM_ALBUM_SIZE,
+    )
+
+    total_albums = len(
+        album_chunks
+    )
+
+    logger.info(
+        "Dispatching post: %s media, "
+        "%s album(s), %s other media, "
+        "%s destination(s)",
+        len(media),
+        total_albums,
+        len(other_media),
+        len(channels),
+    )
+
+    # ========================================================
+    # DESTINATIONS
+    # ========================================================
+
+    for channel_index, channel_id in enumerate(
+        channels
+    ):
+
         try:
-            # Photos/videos can be grouped into an album.
-            album_media = [
-                item
-                for item in media
-                if item["type"] in {"photo", "video"}
-            ]
 
-            other_media = [
-                item
-                for item in media
-                if item["type"] not in {"photo", "video"}
-            ]
+            logger.info(
+                "Posting to destination %s/%s: %s",
+                channel_index + 1,
+                len(channels),
+                channel_id,
+            )
 
-            if len(album_media) >= 2:
-                # Telegram media groups support up to 10 items.
-                await send_album(
-                    bot,
+            # ------------------------------------------------
+            # ALBUMS
+            # ------------------------------------------------
+
+            for album_index, chunk in enumerate(
+                album_chunks
+            ):
+
+                logger.info(
+                    "Sending album %s/%s to %s "
+                    "(%s files)",
+                    album_index + 1,
+                    total_albums,
                     channel_id,
-                    album_media[:10],
-                    caption,
+                    len(chunk),
                 )
 
-            elif len(album_media) == 1:
-                await send_single_media(
-                    bot,
-                    channel_id,
-                    album_media[0],
-                    caption,
+                album_caption = (
+                    caption
+                    if album_index == 0
+                    else ""
                 )
 
-            for index, item in enumerate(other_media):
-                item_caption = caption if not album_media and index == 0 else ""
+                if len(chunk) == 1:
+
+                    await send_single_media(
+                        bot,
+                        channel_id,
+                        chunk[0],
+                        album_caption,
+                    )
+
+                else:
+
+                    await send_album(
+                        bot,
+                        channel_id,
+                        chunk,
+                        album_caption,
+                    )
+
+                # Small gap between split albums.
+                if album_index < total_albums - 1:
+
+                    await asyncio.sleep(1)
+
+            # ------------------------------------------------
+            # INDIVIDUAL MEDIA
+            # ------------------------------------------------
+
+            for index, item in enumerate(
+                other_media
+            ):
+
+                item_caption = ""
+
+                if (
+                    not album_media
+                    and index == 0
+                ):
+
+                    item_caption = caption
 
                 await send_single_media(
                     bot,
@@ -795,34 +1176,62 @@ async def dispatch_post(
                 )
 
             logger.info(
-                "Post successfully sent to channel %s",
+                "Post successfully sent to %s",
                 channel_id,
             )
 
-        except (BadRequest, Forbidden) as error:
+        except BadRequest as error:
+
+            # Permanent Telegram request error.
             logger.error(
-                "Permanent Telegram error for channel %s: %s",
+                "Telegram rejected destination %s: %s",
+                channel_id,
+                error,
+            )
+
+        except Forbidden as error:
+
+            # Bot doesn't have access/permission.
+            logger.error(
+                "Telegram permission/access error "
+                "for %s: %s",
                 channel_id,
                 error,
             )
 
         except Exception:
+
             logger.exception(
-                "Failed to send post to channel %s",
+                "Failed to send post to %s",
                 channel_id,
             )
 
-        if delay > 0 and channel_index < len(channels) - 1:
-            await asyncio.sleep(delay)
+        # ----------------------------------------------------
+        # DELAY BETWEEN DESTINATIONS
+        # ----------------------------------------------------
+
+        if (
+            delay > 0
+            and channel_index < len(channels) - 1
+        ):
+
+            logger.info(
+                "Waiting %s seconds "
+                "before next destination.",
+                delay,
+            )
+
+            await asyncio.sleep(
+                delay
+            )
 
 
 # ============================================================
 # PERSISTENT JOB CALLBACK
 # ============================================================
 
-async def persistent_job_callback(
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def persistent_job_callback(context):
+
     job = context.job
 
     if not job:
@@ -830,45 +1239,88 @@ async def persistent_job_callback(
 
     job_id = job.data
 
-    stored_job = scheduler_db.get_job(job_id)
+    logger.info(
+        "Executing persistent job %s",
+        job_id,
+    )
+
+    stored_job = scheduler_db.get_job(
+        job_id
+    )
 
     if not stored_job:
+
         logger.warning(
-            "Persistent job %s no longer exists.",
+            "Job %s no longer exists.",
             job_id,
         )
+
         return
 
     try:
-        data = json.loads(stored_job["data"])
+
+        data = json.loads(
+            stored_job["data"]
+        )
 
         await dispatch_post(
             context.application,
             data,
         )
 
+        logger.info(
+            "Persistent job %s finished.",
+            job_id,
+        )
+
     except Exception:
+
         logger.exception(
             "Persistent job %s failed.",
             job_id,
         )
 
     finally:
+
+        # ----------------------------------------------------
+        # ONE-TIME JOB
+        # ----------------------------------------------------
+
         if stored_job["job_type"] == "one_time":
-            scheduler_db.delete_one_time_job(job_id)
+
+            scheduler_db.delete_one_time_job(
+                job_id
+            )
+
+        # ----------------------------------------------------
+        # REPEATING JOB
+        # ----------------------------------------------------
 
         else:
-            interval = stored_job["interval_seconds"]
+
+            interval = stored_job[
+                "interval_seconds"
+            ]
 
             if interval:
+
                 next_run = (
-                    datetime.now().timestamp()
-                    + interval
+                    utc_now()
+                    + timedelta(
+                        seconds=interval
+                    )
                 )
 
                 scheduler_db.update_run_time(
                     job_id,
-                    next_run,
+                    next_run.timestamp(),
+                )
+
+                logger.info(
+                    "Next execution for "
+                    "repeating job %s: %s",
+                    job_id,
+                    next_run.astimezone(IST),
                 )
 
 
@@ -877,21 +1329,41 @@ async def persistent_job_callback(
 # ============================================================
 
 async def schedule_saved_job(
-    application: Application,
-    job_id: str,
-    run_at: datetime,
+    application,
+    job_id,
+    run_at,
 ):
-    stored_job = scheduler_db.get_job(job_id)
+    stored_job = scheduler_db.get_job(
+        job_id
+    )
 
     if not stored_job:
         return
 
-    current_time = datetime.now()
-
-    if run_at < current_time:
-        run_at = current_time
+    # ========================================================
+    # ONE-TIME JOB
+    # ========================================================
 
     if stored_job["job_type"] == "one_time":
+
+        if run_at.tzinfo is None:
+
+            # Old/legacy naive datetime:
+            # interpret it as IST.
+            run_at = run_at.replace(
+                tzinfo=IST
+            )
+
+        run_at = run_at.astimezone(
+            UTC
+        )
+
+        current_time = utc_now()
+
+        if run_at < current_time:
+
+            run_at = current_time
+
         application.job_queue.run_once(
             persistent_job_callback,
             when=run_at,
@@ -899,32 +1371,79 @@ async def schedule_saved_job(
             name=f"telepost_{job_id}",
         )
 
+        logger.info(
+            "Scheduled one-time job %s "
+            "for %s",
+            job_id,
+            run_at.astimezone(IST),
+        )
+
+    # ========================================================
+    # REPEATING JOB
+    # ========================================================
+
     elif stored_job["job_type"] == "repeating":
-        interval = stored_job["interval_seconds"]
+
+        interval = stored_job[
+            "interval_seconds"
+        ]
 
         if not interval:
+
+            logger.error(
+                "Repeating job %s has no interval.",
+                job_id,
+            )
+
             return
+
+        # First execution happens approximately
+        # 2 seconds from now.
+        first_run = (
+            utc_now()
+            + timedelta(
+                seconds=2
+            )
+        )
 
         application.job_queue.run_repeating(
             persistent_job_callback,
             interval=interval,
-            first=run_at,
+            first=first_run,
             data=job_id,
             name=f"telepost_{job_id}",
         )
 
+        # Store next execution time.
+        scheduler_db.update_run_time(
+            job_id,
+            first_run.timestamp(),
+        )
+
+        logger.info(
+            "Scheduled repeating job %s "
+            "to run first at %s "
+            "and repeat every %s seconds.",
+            job_id,
+            first_run.astimezone(IST),
+            interval,
+        )
+
 
 # ============================================================
-# RESTORE JOBS AFTER RESTART
+# RESTORE SAVED JOBS
 # ============================================================
 
-async def restore_saved_jobs(
-    application: Application,
-):
+async def restore_saved_jobs(application):
+
     jobs = scheduler_db.get_active_jobs()
 
     if not jobs:
-        logger.info("No saved jobs to restore.")
+
+        logger.info(
+            "No saved jobs to restore."
+        )
+
         return
 
     logger.info(
@@ -932,19 +1451,47 @@ async def restore_saved_jobs(
         len(jobs),
     )
 
-    current_time = datetime.now()
+    current_time = utc_now()
 
     for job in jobs:
+
         try:
+
             if job["run_at"]:
+
                 run_at = datetime.fromtimestamp(
-                    job["run_at"]
+                    job["run_at"],
+                    tz=UTC,
                 )
+
             else:
+
                 run_at = current_time
 
-            if run_at < current_time:
-                run_at = current_time
+            # ------------------------------------------------
+            # ONE-TIME
+            # ------------------------------------------------
+
+            if job["job_type"] == "one_time":
+
+                if run_at < current_time:
+
+                    run_at = current_time
+
+            # ------------------------------------------------
+            # REPEATING
+            # ------------------------------------------------
+
+            elif job["job_type"] == "repeating":
+
+                if run_at < current_time:
+
+                    run_at = (
+                        current_time
+                        + timedelta(
+                            seconds=2
+                        )
+                    )
 
             await schedule_saved_job(
                 application,
@@ -958,6 +1505,7 @@ async def restore_saved_jobs(
             )
 
         except Exception:
+
             logger.exception(
                 "Failed to restore job %s",
                 job["id"],
@@ -968,65 +1516,127 @@ async def restore_saved_jobs(
 # POST INIT
 # ============================================================
 
-async def post_init(
-    application: Application,
-):
-    await restore_saved_jobs(application)
+async def post_init(application):
+
+    await restore_saved_jobs(
+        application
+    )
 
 
 # ============================================================
-# LIST JOBS
+# /LISTJOBS
 # ============================================================
 
-async def listjobs_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def listjobs_command(update, context):
+
     if not await owner_only(update, context):
         return
 
     jobs = scheduler_db.get_active_jobs()
 
     if not jobs:
+
         await update.message.reply_text(
             "📭 No active scheduled jobs."
         )
+
         return
 
-    lines = ["📋 <b>Active Jobs</b>\n"]
+    lines = [
+        "📋 <b>Active Jobs</b>\n"
+    ]
 
     for job in jobs:
+
         job_id = job["id"]
+
         job_type = job["job_type"]
 
         if job["run_at"]:
-            run_at = datetime.fromtimestamp(
+
+            run_at_text = format_ist(
                 job["run_at"]
-            ).strftime("%Y-%m-%d %H:%M:%S")
+            )
+
         else:
-            run_at = "N/A"
+
+            run_at_text = "N/A"
+
+        try:
+
+            job_data = json.loads(
+                job["data"]
+            )
+
+            media_count = len(
+                job_data.get(
+                    "media",
+                    [],
+                )
+            )
+
+            destination_count = len(
+                job_data.get(
+                    "channels",
+                    [],
+                )
+            )
+
+        except Exception:
+
+            media_count = "?"
+            destination_count = "?"
+
+        # ----------------------------------------------------
+        # REPEATING
+        # ----------------------------------------------------
 
         if job_type == "repeating":
-            interval = job["interval_seconds"]
+
+            interval = job[
+                "interval_seconds"
+            ]
 
             if interval == 3600:
-                interval_text = "Every hour"
+
+                interval_text = (
+                    "Every hour"
+                )
+
             elif interval == 86400:
-                interval_text = "Every 24 hours"
+
+                interval_text = (
+                    "Every 24 hours"
+                )
+
             else:
-                interval_text = f"Every {interval}s"
+
+                interval_text = (
+                    f"Every {interval}s"
+                )
 
             lines.append(
                 f"🔁 <code>{job_id}</code>\n"
                 f"   {interval_text}\n"
-                f"   Next: {run_at}\n"
+                f"   Media: {media_count}/50\n"
+                f"   Destinations: "
+                f"{destination_count}\n"
+                f"   Next: {run_at_text}\n"
             )
 
+        # ----------------------------------------------------
+        # ONE-TIME
+        # ----------------------------------------------------
+
         else:
+
             lines.append(
                 f"⏰ <code>{job_id}</code>\n"
                 f"   One-time\n"
-                f"   Run: {run_at}\n"
+                f"   Media: {media_count}/50\n"
+                f"   Destinations: "
+                f"{destination_count}\n"
+                f"   Run: {run_at_text}\n"
             )
 
     await update.message.reply_text(
@@ -1036,51 +1646,56 @@ async def listjobs_command(
 
 
 # ============================================================
-# CANCEL JOB
+# /CANCELJOB
 # ============================================================
 
-async def canceljob_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def canceljob_command(update, context):
+
     if not await owner_only(update, context):
         return
 
     if not context.args:
+
         await update.message.reply_text(
             "Usage:\n"
             "/canceljob JOB_ID"
         )
+
         return
 
     job_id = context.args[0].strip()
 
-    deleted = scheduler_db.delete_job(job_id)
+    deleted = scheduler_db.delete_job(
+        job_id
+    )
 
     if not deleted:
+
         await update.message.reply_text(
             "❌ Job not found."
         )
+
         return
 
     for job in context.application.job_queue.jobs():
+
         if job.name == f"telepost_{job_id}":
+
             job.schedule_removal()
 
     await update.message.reply_text(
-        f"🗑 Job <code>{html.escape(job_id)}</code> cancelled.",
+        f"🗑 Job <code>{html.escape(job_id)}</code> "
+        "cancelled.",
         parse_mode=ParseMode.HTML,
     )
 
 
 # ============================================================
-# CANCEL CONVERSATION
+# /CANCEL
 # ============================================================
 
-async def cancel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def cancel_command(update, context):
+
     if not await owner_only(update, context):
         return ConversationHandler.END
 
@@ -1094,49 +1709,72 @@ async def cancel_command(
 
 
 # ============================================================
-# CHANNEL ID
+# /CHANNELID
 # ============================================================
 
-async def channelid_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def channelid_command(update, context):
+
     if not await owner_only(update, context):
         return
 
     if not context.args:
+
         await update.message.reply_text(
             "Usage:\n"
             "/channelid @channelusername"
         )
+
         return
 
     username = context.args[0].strip()
 
     if not username.startswith("@"):
-        username = f"@{username}"
+
+        username = "@" + username
 
     try:
+
         chat = await retry_operation(
-            lambda: context.bot.get_chat(username),
+            lambda: context.bot.get_chat(
+                username
+            ),
             "get channel ID",
         )
 
         await update.message.reply_text(
-            "📢 Channel information\n\n"
-            f"Title: {html.escape(chat.title or 'Unknown')}\n"
+            "📢 <b>Chat information</b>\n\n"
+            f"Title: "
+            f"{html.escape(chat.title or 'Unknown')}\n"
             f"ID: <code>{chat.id}</code>\n"
-            f"Username: {html.escape(chat.username or 'None')}",
+            f"Username: "
+            f"{html.escape(chat.username or 'None')}",
             parse_mode=ParseMode.HTML,
         )
 
+    except BadRequest as error:
+
+        await update.message.reply_text(
+            "❌ Telegram could not find or access "
+            "that chat.\n\n"
+            f"Error: {error}"
+        )
+
+    except Forbidden as error:
+
+        await update.message.reply_text(
+            "❌ The bot does not have access "
+            "to that chat.\n\n"
+            f"Error: {error}"
+        )
+
     except Exception as error:
+
         logger.exception(
             "Failed to get channel ID."
         )
 
         await update.message.reply_text(
-            f"❌ Could not access that channel.\n\n"
+            "❌ Could not access that chat.\n\n"
             f"Error: {error}"
         )
 
@@ -1146,9 +1784,10 @@ async def channelid_command(
 # ============================================================
 
 async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
+    update,
+    context,
 ):
+
     logger.exception(
         "Unhandled bot exception",
         exc_info=context.error,
@@ -1160,6 +1799,7 @@ async def error_handler(
 # ============================================================
 
 def build_application():
+
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -1167,56 +1807,95 @@ def build_application():
         .build()
     )
 
+    # ========================================================
+    # CONVERSATION
+    # ========================================================
+
     conversation = ConversationHandler(
+
         entry_points=[
             CommandHandler(
                 "newpost",
                 newpost_command,
             )
         ],
+
         states={
+
+            # ------------------------------------------------
+            # MEDIA
+            # ------------------------------------------------
+
             WAITING_MEDIA: [
+
                 MessageHandler(
-                    filters.PHOTO
-                    | filters.VIDEO
-                    | filters.Document.ALL
-                    | filters.AUDIO
-                    | filters.VOICE
-                    | filters.ANIMATION,
+                    (
+                        filters.PHOTO
+                        | filters.VIDEO
+                        | filters.Document.ALL
+                        | filters.AUDIO
+                        | filters.VOICE
+                        | filters.ANIMATION
+                    ),
                     receive_media,
                 ),
+
                 CommandHandler(
                     "done",
                     done_media,
                 ),
             ],
+
+            # ------------------------------------------------
+            # CAPTION
+            # ------------------------------------------------
+
             WAITING_CAPTION: [
+
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
                     receive_caption,
                 ),
             ],
+
+            # ------------------------------------------------
+            # DESTINATIONS
+            # ------------------------------------------------
+
             WAITING_CHANNELS: [
+
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND,
                     receive_channels,
                 ),
             ],
+
+            # ------------------------------------------------
+            # DELAY
+            # ------------------------------------------------
+
             WAITING_DELAY: [],
-            WAITING_SCHEDULE: [],
         },
+
         fallbacks=[
             CommandHandler(
                 "cancel",
                 cancel_command,
-            ),
+            )
         ],
+
         allow_reentry=True,
     )
 
-    application.add_handler(conversation)
+    application.add_handler(
+        conversation
+    )
+
+    # ========================================================
+    # COMMANDS
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1260,6 +1939,10 @@ def build_application():
         )
     )
 
+    # ========================================================
+    # DELAY CALLBACK
+    # ========================================================
+
     application.add_handler(
         CallbackQueryHandler(
             delay_callback,
@@ -1267,14 +1950,27 @@ def build_application():
         )
     )
 
+    # ========================================================
+    # SCHEDULE CALLBACK
+    # ========================================================
+
     application.add_handler(
         CallbackQueryHandler(
             schedule_callback,
-            pattern=r"^schedule_(now|1h|24h|hourly|daily)$",
+            pattern=(
+                r"^schedule_"
+                r"(now|1h|24h|hourly|daily)$"
+            ),
         )
     )
 
-    application.add_error_handler(error_handler)
+    # ========================================================
+    # ERROR HANDLER
+    # ========================================================
+
+    application.add_error_handler(
+        error_handler
+    )
 
     return application
 
@@ -1284,20 +1980,54 @@ def build_application():
 # ============================================================
 
 def main():
+
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN is missing from .env"
         )
 
     if not OWNER_ID:
+
         raise RuntimeError(
-            "OWNER_ID is missing or invalid in .env"
+            "OWNER_ID is missing or invalid "
+            "in .env"
         )
 
     logger.info("=" * 60)
-    logger.info("Telepost starting...")
-    logger.info("Owner ID: %s", OWNER_ID)
-    logger.info("Database: %s", scheduler_db.database)
+
+    logger.info(
+        "Telepost starting..."
+    )
+
+    logger.info(
+        "Owner ID: %s",
+        OWNER_ID,
+    )
+
+    logger.info(
+        "Maximum media per post: %s",
+        MAX_MEDIA,
+    )
+
+    logger.info(
+        "Telegram album size: %s",
+        TELEGRAM_ALBUM_SIZE,
+    )
+
+    logger.info(
+        "Scheduler timezone: UTC"
+    )
+
+    logger.info(
+        "Display timezone: Asia/Kolkata"
+    )
+
+    logger.info(
+        "Database: %s",
+        scheduler_db.database,
+    )
+
     logger.info("=" * 60)
 
     application = build_application()
@@ -1307,6 +2037,10 @@ def main():
         drop_pending_updates=False,
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
